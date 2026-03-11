@@ -1,0 +1,12 @@
+# Code owners for automatic review requests
+
+# Default owner for everything
+* @carlgerhardsson
+
+# Workflows require approval
+.github/workflows/* @carlgerhardsson
+
+# Security-related files
+.github/workflows/security.yml @carlgerhardsson
+package.json @carlgerhardsson
+package-lock.json @carlgerhardsson
