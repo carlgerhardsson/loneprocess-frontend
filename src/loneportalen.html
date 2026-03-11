@@ -1,0 +1,976 @@
+<!DOCTYPE html>
+<!-- ==========================================
+     LÖNEPORTALEN - DIGITAL CHECKLISTA
+     Version:        1.5.0
+     Skapad:         2026-02-17
+     Senast ändrad:  2026-02-17 16:00
+     Aktiviteter:    Baserade på POL LA Användarhandbok 2025.2
+     Status:         ✅ Verktygslåda fullt funktionell – redigera aktiviteter
+     ========================================== -->
+<html lang="sv">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Löneportalen v1.5 – POL</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    body { font-family: 'Inter', sans-serif; }
+    .tab-active { border-bottom: 3px solid #6B46C1; color: #6B46C1; font-weight: 600; }
+    .rotate-90 { transform: rotate(90deg); }
+  </style>
+</head>
+<body class="bg-gray-50">
+<div id="app"></div>
+<script>
+/* ===== ANVÄNDARE ===== */
+const USERS = {
+  'lonespecialist@loneportalen.se':   { name:'Elif Bylund',     role:'Lönespecialist',   canComplete:true,  canEdit:false, canDelete:false },
+  'lonechef@loneportalen.se':         { name:'Hassan Sundberg', role:'Lönechef',          canComplete:true,  canEdit:true,  canDelete:true  },
+  'systemspecialist@loneportalen.se': { name:'Tua Jonasson',    role:'Systemspecialist',  canComplete:false, canEdit:true,  canDelete:false }
+};
+
+/* ===== STATE ===== */
+let loggedInUser        = sessionStorage.getItem('user');
+let currentTab          = 'overblick';
+let expandedActivities  = new Set();
+let showCommentModal    = false;
+let commentActivityId   = null;
+let apiStatus           = 'checking';
+let lastApiCheck        = null;
+let apiActivities       = [];
+let selectedActivityId  = 1;  // För Verktygslådan — default första aktiviteten
+
+/* ── Per-period state ──────────────────────────────────────────
+   currentPeriod: den valda månaden, t.ex. "2025-03"
+   periodData:    { "2025-03": { activityId: { done, status, comment, checklist:{itemId:done} } } }
+   Sparas i localStorage så att data överlever omladdning.
+*/
+let currentPeriod = '2025-03';
+let periodData    = {};   // laddas från localStorage i init()
+
+const STORAGE_KEY = 'loneportalen_periodData';
+
+function loadPeriodData() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) periodData = JSON.parse(raw);
+  } catch { periodData = {}; }
+}
+
+function savePeriodData() {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(periodData)); } catch {}
+}
+
+/* Hämtar sparad status för en aktivitet i given period */
+function getPeriodActivity(period, activityId) {
+  return periodData[period]?.[activityId] || null;
+}
+
+/* Skriver status för en aktivitet i given period */
+function setPeriodActivity(period, activityId, patch) {
+  if (!periodData[period]) periodData[period] = {};
+  periodData[period][activityId] = { ...(periodData[period][activityId] || {}), ...patch };
+  savePeriodData();
+}
+
+/* Applicerar sparad period-status på activities-mallen → returnerar hydrated lista */
+function hydrateActivities(period) {
+  return activities.map(a => {
+    const saved = getPeriodActivity(period, a.id);
+    if (!saved) return { ...a, done:false, status:0, comment:'', checklist: a.checklist.map(i=>({...i,done:false})) };
+    return {
+      ...a,
+      done:    saved.done    ?? false,
+      status:  saved.status  ?? 0,
+      comment: saved.comment ?? '',
+      checklist: a.checklist.map(i => ({
+        ...i,
+        done: saved.checklist?.[i.id] ?? false
+      }))
+    };
+  });
+}
+
+/* Den aktuellt hydraterade listan används av render-funktionerna */
+let hydrated = [];
+
+const API_BASE_URL  = 'http://localhost:8000';
+const API_ENDPOINTS = { health:'/health', activities:'/api/v1/activities', periods:'/api/v1/loneperiods' };
+
+/* ===== AKTIVITETER – baserade på POL LA Användarhandbok 2025.2 =====
+   inAPI: true = hämtas/synkas mot backend-API (POL LA endpoints)
+   Fas:
+     'fore'    = Före löneberäkning  (Lön 1)
+     'kontroll'= Kontrollperiod      (Mellanperiod)
+     'efter'   = Efter löneberäkning (Lön klar)
+*/
+let activities = [
+
+  /* ─── FAS 1: FÖRE LÖNEBERÄKNING ─────────────────────────────── */
+  {
+    id:1, processNr:'1.1', phase:'fore',
+    name:'Kontrollera driftsbilden',
+    person:'Tua Jonasson',
+    done:false, status:0, comment:'', link:'LA > Arkiv > Driftsbild',
+    inAPI:false,
+    checklist:[
+      { id:101, name:'Kontrollera körningsstatus "För registrering"',                      done:false, errorLists:[], reports:[] },
+      { id:102, name:'Kontrollera att rätt period är markerad som körningsperiod',          done:false, errorLists:[], reports:[] },
+      { id:103, name:'Bekräfta att AGI-redovisningskörning för föregående månad är slutförd', done:false, errorLists:[], reports:[] }
+    ],
+    polRef:'Driftsbilden (Arkiv > Driftsbild) – POL LA s. 272'
+  },
+  {
+    id:2, processNr:'1.2', phase:'fore',
+    name:'Hantera nyanställningar och anställningsändringar',
+    person:'Elif Bylund',
+    done:false, status:0, comment:'', link:'LA > Lönerapportering > Anställningsregister',
+    inAPI:true,
+    checklist:[
+      { id:201, name:'Registrera nyanställningar i personregistret',                        done:false, errorLists:[], reports:['Personlogg'] },
+      { id:202, name:'Bekräfta väntande anställningar (händelse på startsidan)',             done:false, errorLists:[], reports:[] },
+      { id:203, name:'Kontrollera obligatoriska fält (personnr, skattekod, bankkonto)',      done:false, errorLists:['Sambandskontroll person-/anst.register'], reports:[] },
+      { id:204, name:'Kontrollera obeviljad föräldraledighet',                              done:false, errorLists:[], reports:[] }
+    ],
+    polRef:'Hantera anställd – POL LA s. 128; Bekräfta anställning s. 129'
+  },
+  {
+    id:3, processNr:'1.3', phase:'fore',
+    name:'Registrera slutlöner och avgångar',
+    person:'Elif Bylund',
+    done:false, status:0, comment:'', link:'LA > Anställningsuppgifter > Slutlön i period',
+    inAPI:true,
+    checklist:[
+      { id:301, name:'Ange avgångsdatum i anställningsregistret',         done:false, errorLists:[], reports:[] },
+      { id:302, name:'Kontrollera semesterersättning vid avgång',          done:false, errorLists:[], reports:['Slutlön rapport'] },
+      { id:303, name:'Hantera tömning av tidbanker vid avgång',            done:false, errorLists:[], reports:[] },
+      { id:304, name:'Kontrollera avslutade RAPP Auto-adressater',         done:false, errorLists:[], reports:[] }
+    ],
+    polRef:'Slutlön i period – POL LA s. 49; Anställningsuppgifter s. 48'
+  },
+  {
+    id:4, processNr:'1.4', phase:'fore',
+    name:'Hämta skatteuppgifter (FOS)',
+    person:'Elif Bylund',
+    done:false, status:0, comment:'', link:'LA > Redigera > Underlag FOS-fråga',
+    inAPI:false,
+    checklist:[
+      { id:401, name:'Kontrollera om FOS-frågor behöver skickas till Skatteverket', done:false, errorLists:[], reports:[] },
+      { id:402, name:'Hämta aktuella skatteuppgifter för nyanställda',               done:false, errorLists:[], reports:[] },
+      { id:403, name:'Hantera inkomna FOS-svar',                                    done:false, errorLists:[], reports:[] }
+    ],
+    polRef:'Hämta skatteuppgifter – POL LA s. 84-85; FOS-fråga s. 152-153'
+  },
+  {
+    id:5, processNr:'1.5', phase:'fore',
+    name:'Uppdatera fasta tillägg/avdrag och löneuppgifter',
+    person:'Elif Bylund',
+    done:false, status:0, comment:'', link:'LA > Lönerapportering > Fasta tillägg/avdrag',
+    inAPI:true,
+    checklist:[
+      { id:501, name:'Kontrollera och uppdatera lönerevision / nya löner',                        done:false, errorLists:[], reports:['Ändringslogg grundlön'] },
+      { id:502, name:'Registrera nya fasta tillägg och avdrag',                                   done:false, errorLists:[], reports:[] },
+      { id:503, name:'Beräkna retroaktiv lön (vid behov)',                                        done:false, errorLists:[], reports:[] },
+      { id:504, name:'Granska resultat retroaktivitetsberäkning',                                 done:false, errorLists:[], reports:['Retroresultat'] },
+      { id:505, name:'Föra över godkänd retroaktivitet till Tillfälliga lönehändelser',           done:false, errorLists:[], reports:[] }
+    ],
+    polRef:'Retroaktivitetsberäkning – POL LA s. 269; Fasta tillägg/avdrag s. 184'
+  },
+  {
+    id:6, processNr:'1.6', phase:'fore',
+    name:'Rapportera tillfälliga lönehändelser (frånvaro, OB, övertid m.m.)',
+    person:'Elif Bylund',
+    done:false, status:0, comment:'', link:'LA > Lönerapportering > Tillfälliga lönehändelser',
+    inAPI:true,
+    checklist:[
+      { id:601, name:'Överför attesterade TID-rapporter från Självservice',              done:false, errorLists:['Fellista TID-inläsning'], reports:[] },
+      { id:602, name:'Hantera ev. oattesterade TID-rapporter',                           done:false, errorLists:[], reports:[] },
+      { id:603, name:'Registrera manuell frånvaro (sjuk, semester, föräldraledighet)',   done:false, errorLists:[], reports:[] },
+      { id:604, name:'Kontrollera obeviljad föräldraledighet',                           done:false, errorLists:[], reports:[] },
+      { id:605, name:'Granska tidsavstämning (differens schema vs registrerad tid)',     done:false, errorLists:[], reports:['Tidsavstämningsrapport'] },
+      { id:606, name:'Läs in 7K-händelser (sjukfrånvaro från 7K)',                      done:false, errorLists:[], reports:[] }
+    ],
+    polRef:'Tillfälliga lönehändelser – POL LA s. 195; Överföring TID-rapporter s. 241-243'
+  },
+  {
+    id:7, processNr:'1.7', phase:'fore',
+    name:'Läs in externa filer (bilförmåner, fackavgifter, försäkringsavdrag)',
+    person:'Tua Jonasson',
+    done:false, status:0, comment:'', link:'LA > Arkiv > Speciella rutiner',
+    inAPI:false,
+    checklist:[
+      { id:701, name:'Läs in bilförmåner',                          done:false, errorLists:['Fellista bilförmåner'], reports:[] },
+      { id:702, name:'Läs in fackföreningsavgifter Unionen',        done:false, errorLists:['Fellista fackavgifter'], reports:[] },
+      { id:703, name:'Läs in försäkringsavdrag',                    done:false, errorLists:['Fellista försäkringsavdrag'], reports:[] },
+      { id:704, name:'Kontrollera fellistor efter inläsning',        done:false, errorLists:[], reports:[] }
+    ],
+    polRef:'Speciella rutiner – POL LA s. 244-247'
+  },
+  {
+    id:8, processNr:'1.8', phase:'fore',
+    name:'Konteringsvalidering inför körning',
+    person:'Tua Jonasson',
+    done:false, status:0, comment:'', link:'LA > Rapporter > Konteringsvalidering',
+    inAPI:false,
+    checklist:[
+      { id:801, name:'Kör Konteringsvalidering och granska eventuella fel',   done:false, errorLists:[], reports:['Konteringsvalideringsrapport'] },
+      { id:802, name:'Åtgärda felaktiga kontobegrepp i personregistret',      done:false, errorLists:[], reports:[] }
+    ],
+    polRef:'Konteringsvalidering – POL LA s. 328'
+  },
+
+  /* ─── FAS 2: KONTROLLPERIOD / PROVLÖN ───────────────────────── */
+  {
+    id:9, processNr:'2.1', phase:'kontroll',
+    name:'Starta och granska provlönekörning',
+    person:'Hassan Sundberg',
+    done:false, status:0, comment:'', link:'LA > Arkiv > Till löneberäkning (Preliminär)',
+    inAPI:false,
+    checklist:[
+      { id:901, name:'Starta preliminär lönekörning (provlön)',                                          done:false, errorLists:['Fellista provlön'], reports:[] },
+      { id:902, name:'Invänta att körningen får status "Transaktioner skapade, preliminär"',             done:false, errorLists:[], reports:[] },
+      { id:903, name:'Granska lönespecifikationer för stickprov',                                        done:false, errorLists:[], reports:['Lönespecifikationer (provlön)'] },
+      { id:904, name:'Verifiera att retroaktivitet beräknats korrekt',                                   done:false, errorLists:[], reports:['Retroresultat'] }
+    ],
+    polRef:'Till löneberäkning – POL LA s. 272; Driftsbilden körningsstatus s. 274'
+  },
+  {
+    id:10, processNr:'2.2', phase:'kontroll',
+    name:'Granska felsignaler arbetsgivardeklaration (AGI)',
+    person:'Tua Jonasson',
+    done:false, status:0, comment:'', link:'LA > Arbetsgivardeklaration > Felsignaler',
+    inAPI:false,
+    checklist:[
+      { id:1001, name:'Öppna Felsignaler och granska S-, B- och R-signaler',        done:false, errorLists:['Fellista AGI (S-fel, B-fel, R-kontroller)'], reports:[] },
+      { id:1002, name:'Åtgärda obligatoriska S- och B-fel',                         done:false, errorLists:[], reports:[] },
+      { id:1003, name:'Granska POL-interna P-signaler (skattekod, negativa belopp)',done:false, errorLists:[], reports:[] },
+      { id:1004, name:'Markera behandlade signaler med åtgärdsnoteringar',           done:false, errorLists:[], reports:['Individuppgift SKV'] }
+    ],
+    polRef:'Åtgärda signaler från fellista – POL LA s. 303-304'
+  },
+  {
+    id:11, processNr:'2.3', phase:'kontroll',
+    name:'Granska lönesummor och nyckeltal',
+    person:'Hassan Sundberg',
+    done:false, status:0, comment:'', link:'LA > Lönerapportering > Lönespec',
+    inAPI:false,
+    checklist:[
+      { id:1101, name:'Jämför lönesumma mot föregående period (avvikelsekontroll)',          done:false, errorLists:[], reports:['Lönesummarapport'] },
+      { id:1102, name:'Kontrollera ovanligt höga/låga utbetalningar',                        done:false, errorLists:[], reports:[] },
+      { id:1103, name:'Granska arbetsgivaravgifter och skatteavdrag i huvuduppgiften',       done:false, errorLists:[], reports:['Huvuduppgift AGI'] }
+    ],
+    polRef:'Granska underlaget AGI – POL LA s. 301-302'
+  },
+  {
+    id:12, processNr:'2.4', phase:'kontroll',
+    name:'Kontrollera frånvaro och föräldraledighet',
+    person:'Elif Bylund',
+    done:false, status:0, comment:'', link:'LA > Redigera > Obeviljad föräldraledighet',
+    inAPI:true,
+    checklist:[
+      { id:1201, name:'Granska obeviljad föräldraledighet',                done:false, errorLists:['Fellista frånvaro'], reports:[] },
+      { id:1202, name:'Kontrollera frånvarostatistik och avvikelser',      done:false, errorLists:[], reports:['Frånvarostatistik'] },
+      { id:1203, name:'Verifiera semesterdagar och semesterersättning',    done:false, errorLists:[], reports:['Semesterrapport'] }
+    ],
+    polRef:'Föräldraledighet – POL LA s. 105; Frånvarostatistik s. 349'
+  },
+  {
+    id:13, processNr:'2.5', phase:'kontroll',
+    name:'Korrigera fel från provlönekörning',
+    person:'Elif Bylund',
+    done:false, status:0, comment:'', link:'LA > Lönerapportering > Tillfälliga lönehändelser',
+    inAPI:false,
+    checklist:[
+      { id:1301, name:'Rätta felaktiga transaktioner i Tillfälliga lönehändelser', done:false, errorLists:[], reports:[] },
+      { id:1302, name:'Backa felaktiga frånvarotransaktioner vid behov',           done:false, errorLists:[], reports:[] },
+      { id:1303, name:'Uppdatera felaktiga löne- eller personuppgifter',           done:false, errorLists:[], reports:[] }
+    ],
+    polRef:'Tillfälliga lönehändelser – POL LA s. 195; Långtidsfrånvaro s. 200-201'
+  },
+
+  /* ─── FAS 3: EFTER LÖNEBERÄKNING ────────────────────────────── */
+  {
+    id:14, processNr:'3.1', phase:'efter',
+    name:'Starta och bekräfta definitiv lönekörning',
+    person:'Hassan Sundberg',
+    done:false, status:0, comment:'', link:'LA > Arkiv > Till löneberäkning (Definitiv)',
+    inAPI:false,
+    checklist:[
+      { id:1401, name:'Bekräfta att AGI-körning för föregående period är slutförd', done:false, errorLists:[], reports:[] },
+      { id:1402, name:'Starta definitiv lönekörning',                               done:false, errorLists:['Fellista definitiv körning'], reports:[] },
+      { id:1403, name:'Invänta status "Resultat mottaget" i driftsbilden',          done:false, errorLists:[], reports:['Körningslogg'] }
+    ],
+    polRef:'Driftsbilden körningsstatus – POL LA s. 272-274'
+  },
+  {
+    id:15, processNr:'3.2', phase:'efter',
+    name:'Granska och godkänn lönespecifikationer',
+    person:'Hassan Sundberg',
+    done:false, status:0, comment:'', link:'LA > Lönerapportering > Lönespecifikation',
+    inAPI:false,
+    checklist:[
+      { id:1501, name:'Granska stickprov av definitiva lönespecifikationer',    done:false, errorLists:[], reports:['Lönespecifikationer (definitiv)'] },
+      { id:1502, name:'Kontrollera retroaktiva utbetalningar är korrekta',      done:false, errorLists:[], reports:[] },
+      { id:1503, name:'Verifiera avgångna anställdas slutlöner',                done:false, errorLists:[], reports:[] }
+    ],
+    polRef:'Den anställdes lönespecifikation – POL LA s. 270-271'
+  },
+  {
+    id:16, processNr:'3.3', phase:'efter',
+    name:'Hantera extrautbetalningar och justeringar',
+    person:'Elif Bylund',
+    done:false, status:0, comment:'', link:'LA > Lönerapportering > Extrautbetalning',
+    inAPI:false,
+    checklist:[
+      { id:1601, name:'Hantera eventuella extrautbetalningar',                          done:false, errorLists:[], reports:['Extrautbetalningslista'] },
+      { id:1602, name:'Justera lönespecifikationer (Justera lönespecifikation)',         done:false, errorLists:[], reports:[] },
+      { id:1603, name:'Kör AGI redovisningskörning efter extrautbetalningar',           done:false, errorLists:[], reports:[] }
+    ],
+    polRef:'Extrautbetalningar och korrigeringar – POL LA s. 305; Extrautbetalning s. 224-226'
+  },
+  {
+    id:17, processNr:'3.4', phase:'efter',
+    name:'Skicka bankfil och bekräfta utbetalning',
+    person:'Hassan Sundberg',
+    done:false, status:0, comment:'', link:'LA > Rapporter > Skapa bankfil',
+    inAPI:false,
+    checklist:[
+      { id:1701, name:'Skapa och skicka bankfil till bank',                  done:false, errorLists:[], reports:['Bankfil'] },
+      { id:1702, name:'Bekräfta att utbetalning registrerats hos banken',    done:false, errorLists:[], reports:[] },
+      { id:1703, name:'Skapa bankfil för eventuella förskott',               done:false, errorLists:[], reports:['Utbetalningslista'] }
+    ],
+    polRef:'Skapa bankfil för förskott – POL LA s. 344'
+  },
+  {
+    id:18, processNr:'3.5', phase:'efter',
+    name:'AGI-redovisning till Skatteverket',
+    person:'Tua Jonasson',
+    done:false, status:0, comment:'', link:'LA > Arbetsgivardeklaration',
+    inAPI:false,
+    checklist:[
+      { id:1801, name:'Verifiera individuppgifter och huvuduppgift',        done:false, errorLists:[], reports:['Individuppgift SKV','Huvuduppgift AGI'] },
+      { id:1802, name:'Utför AGI redovisningskörning',                      done:false, errorLists:['AGI-felsignaler (S, B, R, P)'], reports:[] },
+      { id:1803, name:'Ladda upp fil hos Skatteverket',                     done:false, errorLists:[], reports:[] },
+      { id:1804, name:'Kontrollera att redovisningsperiod är korrekt angiven', done:false, errorLists:[], reports:[] }
+    ],
+    polRef:'Granska underlaget AGI – POL LA s. 301-305; AGI redovisningskörning s. 278'
+  },
+  {
+    id:19, processNr:'3.6', phase:'efter',
+    name:'Stäm av ackumulatorer och tidbanker',
+    person:'Tua Jonasson',
+    done:false, status:0, comment:'', link:'LA > Lönerapportering > Ackumulatorer',
+    inAPI:false,
+    checklist:[
+      { id:1901, name:'Granska beloppsackumulatorer (semester, övertid, komp)', done:false, errorLists:[], reports:['Ackumulatorrapport'] },
+      { id:1902, name:'Kontrollera tidbanker – kvarvarande saldo',              done:false, errorLists:[], reports:['Tidbanksrapport'] },
+      { id:1903, name:'Verifiera att flextidssaldon är rimliga',                done:false, errorLists:[], reports:[] }
+    ],
+    polRef:'Ackumulatorer – POL LA s. 122; Tidbanker s. 389'
+  },
+  {
+    id:20, processNr:'3.7', phase:'efter',
+    name:'Rensa och arkivera – stäng löneperioden',
+    person:'Hassan Sundberg',
+    done:false, status:0, comment:'', link:'LA > Arkiv > Driftsbild',
+    inAPI:false,
+    checklist:[
+      { id:2001, name:'Kontrollera att alla körningar har status "Resultat mottaget"', done:false, errorLists:[], reports:[] },
+      { id:2002, name:'Rensa gamla historikposter vid behov (Rensning av historik)',   done:false, errorLists:[], reports:[] },
+      { id:2003, name:'Arkivera körningsloggar och rapporter',                         done:false, errorLists:[], reports:['Styrregisterlogg','Ändringslogg'] },
+      { id:2004, name:'Kontrollera att nästa periods driftsbild är korrekt',           done:false, errorLists:[], reports:[] }
+    ],
+    polRef:'Rensning av historik – POL LA s. 533; Driftsbilden s. 272'
+  }
+];
+
+/* ===== API ===== */
+async function checkApiHealth() {
+  try {
+    const r = await fetch(API_BASE_URL + API_ENDPOINTS.health);
+    if (r.ok) { apiStatus = 'connected'; lastApiCheck = new Date(); return true; }
+    apiStatus = 'disconnected'; return false;
+  } catch { apiStatus = 'disconnected'; return false; }
+}
+async function loadActivitiesFromAPI() {
+  try {
+    const r = await fetch(API_BASE_URL + API_ENDPOINTS.activities);
+    if (r.ok) {
+      apiActivities = await r.json();
+      activities.forEach(a => { a.inAPI = a.inAPI && !!apiActivities.find(x => x.id === a.id || x.name === a.name || x.benämning === a.name); });
+      apiStatus = 'connected'; return true;
+    }
+    apiStatus = 'disconnected'; return false;
+  } catch { apiStatus = 'disconnected'; return false; }
+}
+async function saveActivityToAPI(a) {
+  if (apiStatus !== 'connected' || !a.inAPI) return;
+  try { await fetch(API_BASE_URL + API_ENDPOINTS.activities + '/' + a.id, { method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ id:a.id, name:a.name, completed:a.done, completion_percentage:a.status, comment:a.comment }) }); } catch {}
+}
+
+/* ===== RENDER ===== */
+function render() {
+  hydrated = hydrateActivities(currentPeriod);
+  document.getElementById('app').innerHTML = (!loggedInUser || !USERS[loggedInUser]) ? renderLogin() : renderApp();
+}
+
+function renderLogin() { return `
+  <div class="min-h-screen flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-xl p-8 w-full max-w-md">
+      <div class="text-center mb-6">
+        <div class="text-6xl mb-4">✓</div>
+        <h1 class="text-3xl font-bold mb-1">Löneportal</h1>
+        <p class="text-gray-500 text-sm mb-2">Digital Checklista – POL LA 2025.2</p>
+        <span class="inline-block px-3 py-1 bg-purple-100 text-purple-700 text-xs font-bold rounded-full">v1.5.0</span>
+        <p class="text-gray-400 text-xs mt-1">Senast ändrad: 2026-02-17 16:00</p>
+      </div>
+      <div class="space-y-3">
+        <input type="email" id="emailInput" placeholder="din@email.se" class="w-full px-4 py-3 border rounded-lg focus:ring-2 focus:ring-purple-500">
+        <button onclick="login()" class="w-full bg-purple-600 text-white py-3 rounded-lg font-medium hover:bg-purple-700">Logga in</button>
+      </div>
+      <div class="mt-6 p-4 bg-gray-50 rounded-lg text-sm">
+        <p class="font-medium mb-2">Testanvändare:</p>
+        <button onclick="quickLogin('lonespecialist@loneportalen.se')"   class="text-purple-600 block mb-1 hover:underline text-left">lonespecialist@loneportalen.se</button>
+        <button onclick="quickLogin('lonechef@loneportalen.se')"         class="text-purple-600 block mb-1 hover:underline text-left">lonechef@loneportalen.se</button>
+        <button onclick="quickLogin('systemspecialist@loneportalen.se')" class="text-purple-600 block hover:underline text-left">systemspecialist@loneportalen.se</button>
+        <p class="text-gray-400 mt-2 text-xs">Lösenord: demo123</p>
+      </div>
+    </div>
+  </div>`; }
+
+function renderApp() {
+  const u = USERS[loggedInUser];
+  return `
+  <header class="bg-white shadow-sm border-b">
+    <div class="max-w-7xl mx-auto px-4 py-4 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 bg-purple-600 rounded-lg flex items-center justify-center text-white font-bold text-lg">L</div>
+        <div>
+          <h1 class="text-xl font-bold">Löneportal <span class="text-xs font-normal text-gray-400">v1.5.0</span></h1>
+          <p class="text-xs text-gray-500">Digital Checklista – POL LA 2025.2</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-4">
+        <div class="text-right"><p class="text-sm font-semibold">${u.name}</p><p class="text-xs text-gray-500">${u.role}</p></div>
+        <button onclick="logout()" class="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-lg">Logga ut</button>
+      </div>
+    </div>
+  </header>
+  <nav class="bg-white border-b">
+    <div class="max-w-7xl mx-auto px-4 flex gap-8">
+      <button onclick="changeTab('overblick')" class="py-4 text-sm ${currentTab==='overblick'?'tab-active':'text-gray-600'}">Överblick</button>
+      <button onclick="changeTab('perioder')"  class="py-4 text-sm ${currentTab==='perioder' ?'tab-active':'text-gray-600'}">Löneperioder</button>
+      <button onclick="changeTab('verktyg')"   class="py-4 text-sm ${currentTab==='verktyg'  ?'tab-active':'text-gray-600'}">Verktygslåda</button>
+    </div>
+  </nav>
+  <main class="max-w-7xl mx-auto px-4 py-6 mb-16">
+    ${currentTab==='overblick' ? renderOversikt(u) : ''}
+    ${currentTab==='perioder'  ? renderPerioder(u) : ''}
+    ${currentTab==='verktyg'   ? renderVerktyg()   : ''}
+  </main>
+  ${renderFooter()}
+  ${showCommentModal ? renderCommentModal() : ''}`; }
+
+function renderOversikt(u) {
+  const totalSteps = hydrated.reduce((s,a) => s + (a.checklist.length || 1), 0);
+  const doneSteps  = hydrated.reduce((s,a) => {
+    if (a.checklist.length > 0) return s + a.checklist.filter(i=>i.done).length;
+    return s + (a.done ? 1 : 0);
+  }, 0);
+  const done  = hydrated.filter(a=>a.done).length;
+  const total = hydrated.length;
+  const pct   = Math.round(doneSteps / totalSteps * 100);
+  const fore  = hydrated.filter(a=>a.phase==='fore');
+  const kont  = hydrated.filter(a=>a.phase==='kontroll');
+  const eft   = hydrated.filter(a=>a.phase==='efter');
+  const fp    = pctOf(fore), kp = pctOf(kont), ep = pctOf(eft);
+
+  // Månadsnamn på svenska
+  const monthNames = ['Januari','Februari','Mars','April','Maj','Juni','Juli','Augusti','September','Oktober','November','December'];
+  const [yr, mo] = currentPeriod.split('-');
+  const monthLabel = monthNames[parseInt(mo,10)-1] + ' ' + yr;
+
+  // Perioder med sparad data – visa som chips
+  const savedPeriods = Object.keys(periodData).sort();
+
+  return `
+  ${!u.canComplete?'<div class="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-4"><p class="text-sm text-yellow-800">⚠️ Du har endast läsrättigheter för aktiviteter</p></div>':''}
+
+  <div class="bg-white p-4 rounded-lg shadow-sm mb-4">
+    <div class="grid grid-cols-2 gap-4 mb-3">
+      <div>
+        <label class="block text-xs font-medium text-gray-600 mb-1">Period</label>
+        <input type="month" value="${currentPeriod}" onchange="changePeriod(this.value)"
+          class="w-full px-3 py-2 border rounded-md text-sm focus:ring-2 focus:ring-purple-400">
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-gray-600 mb-1">Bemanningsområde</label>
+        <select class="w-full px-3 py-2 border rounded-md text-sm">
+          <option>Hela installationen</option><option>Löneadministration</option><option>Systemförvaltare</option>
+        </select>
+      </div>
+    </div>
+    ${savedPeriods.length > 1 ? `
+    <div class="flex items-center gap-2 flex-wrap pt-2 border-t">
+      <span class="text-xs text-gray-400">Perioder med data:</span>
+      ${savedPeriods.map(p => {
+        const [y,m] = p.split('-');
+        const mn = monthNames[parseInt(m,10)-1].substring(0,3);
+        const isActive = p === currentPeriod;
+        const pSteps = (periodData[p] && Object.keys(periodData[p]).length) ? (() => {
+          const tmp = activities.map(a => {
+            const sv = periodData[p]?.[a.id];
+            return { ...a, done: sv?.done??false, checklist: a.checklist.map(i=>({...i,done:sv?.checklist?.[i.id]??false})) };
+          });
+          const tot = tmp.reduce((s,a)=>s+(a.checklist.length||1),0);
+          const dn  = tmp.reduce((s,a)=>a.checklist.length>0?s+a.checklist.filter(i=>i.done).length:s+(a.done?1:0),0);
+          return Math.round(dn/tot*100);
+        })() : 0;
+        return `<button onclick="changePeriod('${p}')"
+          class="flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border transition-all
+          ${isActive ? 'bg-purple-600 text-white border-purple-600' : 'bg-white text-gray-600 border-gray-300 hover:border-purple-400'}">
+          ${mn} ${y}
+          <span class="${isActive?'bg-purple-400':'bg-gray-200'} rounded-full px-1.5 py-0.5 text-xs">${pSteps}%</span>
+        </button>`;
+      }).join('')}
+    </div>` : ''}
+  </div>
+
+  <div class="bg-white p-5 rounded-lg shadow-sm mb-4">
+    <div class="flex justify-between items-start mb-1">
+      <div>
+        <span class="text-sm font-medium text-gray-700">Total framdrift</span>
+        <span class="ml-2 text-xs text-gray-400 font-normal">${monthLabel}</span>
+      </div>
+      <span class="text-lg font-bold text-purple-600">${pct}%</span>
+    </div>
+    <div class="w-full bg-gray-200 rounded-full h-3">
+      <div class="h-3 rounded-full transition-all duration-500 ${pct>=100?'bg-green-500':pct>0?'bg-purple-600':'bg-gray-300'}" style="width:${pct}%"></div>
+    </div>
+    <p class="text-xs text-gray-500 mt-1">${done} av ${total} aktiviteter slutförda · ${doneSteps} av ${totalSteps} delsteg klara</p>
+  </div>
+
+  <div class="bg-white p-6 rounded-lg shadow-sm mb-4">
+    <h3 class="text-sm font-semibold text-gray-700 mb-5">Framdrift per fas – ${monthLabel}</h3>
+    <div class="grid grid-cols-3 gap-5">
+      ${phaseCard('Före Löneberäkning (Lön 1)',     'Rapportering & Förberedelse','blue',   fp, fore)}
+      ${phaseCard('Kontrollperiod (Mellanperiod)',   'Provlön & Kontroller',       'orange', kp, kont)}
+      ${phaseCard('Efter Löneberäkning (Lön klar)', 'Definitiv & Avstämning',     'green',  ep, eft)}
+    </div>
+  </div>
+
+  <div class="bg-white rounded-lg shadow-sm overflow-hidden">
+    <div class="px-4 py-3 border-b bg-gray-50 flex justify-between items-center">
+      <h3 class="text-sm font-semibold">Aktiviteter <span class="text-gray-400 font-normal">– ${monthLabel} (${total} st)</span></h3>
+      <div class="flex gap-2">
+        <button class="text-xs text-gray-500 px-3 py-1 border rounded">🔍 Sök</button>
+        <button class="text-xs text-gray-500 px-3 py-1 border rounded">⚙️ Filter</button>
+      </div>
+    </div>
+    <table class="w-full">
+      <thead class="bg-gray-50 border-b">
+        <tr>
+          <th class="px-4 py-3 w-10"></th>
+          <th class="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase w-28">Fas</th>
+          <th class="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase">Aktivitet</th>
+          <th class="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase hidden md:table-cell">Ansvarig</th>
+          <th class="px-4 py-3 text-right text-xs font-semibold text-gray-600 uppercase w-20">Status</th>
+          <th class="px-4 py-3 text-center text-xs font-semibold text-gray-600 uppercase w-16">Klar</th>
+        </tr>
+      </thead>
+      <tbody>${hydrated.map(a=>renderRow(a,u)).join('')}</tbody>
+    </table>
+  </div>`; }
+
+function pctOf(arr) {
+  if (!arr.length) return 0;
+  const total = arr.reduce((s, a) => s + (a.checklist.length || 1), 0);
+  const done  = arr.reduce((s, a) => {
+    if (a.checklist.length > 0) return s + a.checklist.filter(i=>i.done).length;
+    return s + (a.done ? 1 : 0);
+  }, 0);
+  return Math.round(done / total * 100);
+}
+
+function phaseCard(title, sub, theme, pct, list) {
+  const c = {
+    blue:  {b:'border-blue-200',  bg:'bg-blue-50',  h:'text-blue-900',  t:'text-blue-700',  div:'border-blue-300'},
+    orange:{b:'border-orange-200',bg:'bg-orange-50',h:'text-orange-900',t:'text-orange-700',div:'border-orange-300'},
+    green: {b:'border-green-200', bg:'bg-green-50', h:'text-green-900', t:'text-green-700', div:'border-green-300'}
+  }[theme];
+  return `<div class="border-2 ${c.b} rounded-xl p-4 ${c.bg}">
+    <div class="text-center">
+      <h3 class="text-xs font-semibold ${c.h} mb-1 uppercase">${title}</h3>
+      <p class="text-xs ${c.t} mb-3">${sub}</p>
+      ${circle(pct,theme)}
+      <p class="text-xs ${c.t} font-semibold mt-2">${list.filter(a=>a.done).length} av ${list.length} klara</p>
+    </div>
+    <div class="mt-3 pt-3 border-t ${c.div}">
+      <p class="text-xs font-semibold ${c.h} mb-1">Aktiviteter:</p>
+      <ul class="space-y-0.5">${list.map(a=>`<li class="text-xs flex gap-1 items-start">
+        <span class="${a.done?'text-green-600':'text-gray-400'} mt-0.5">${a.done?'✓':'○'}</span>
+        <span class="${a.done?c.h+' line-through opacity-60':c.h}">${a.processNr} ${a.name}</span>
+      </li>`).join('')}</ul>
+    </div>
+  </div>`; }
+
+function circle(pct, theme) {
+  const pal = { blue:{l:'#DBEAFE',m:'#3B82F6',d:'#1E40AF'}, orange:{l:'#FED7AA',m:'#F97316',d:'#C2410C'}, green:{l:'#BBF7D0',m:'#22C55E',d:'#15803D'} }[theme];
+  const col = pct>=67?pal.d:pct>=34?pal.m:'#EF4444';
+  return `<div class="flex flex-col items-center">
+    <div class="relative" style="width:100px;height:100px">
+      <svg width="100" height="100">
+        <circle cx="50" cy="50" r="43" fill="none" stroke="${pal.l}" stroke-width="8"/>
+        <circle cx="50" cy="50" r="43" fill="none" stroke="${col}" stroke-width="8" stroke-dasharray="270" stroke-dashoffset="${270-(pct/100)*270}" stroke-linecap="round" transform="rotate(-90 50 50)"/>
+      </svg>
+      <div class="absolute inset-0 flex items-center justify-center"><span class="text-lg font-bold" style="color:${col}">${pct}%</span></div>
+    </div>
+  </div>`; }
+
+function renderRow(a, u) {
+  const exp = expandedActivities.has(a.id);
+  const pc  = { fore:{bg:'bg-blue-100',tx:'text-blue-800',bo:'border-blue-300'}, kontroll:{bg:'bg-orange-100',tx:'text-orange-800',bo:'border-orange-300'}, efter:{bg:'bg-green-100',tx:'text-green-800',bo:'border-green-300'} }[a.phase];
+  const pn  = { fore:'Lön 1', kontroll:'Kontroll', efter:'Lön&nbsp;klar' }[a.phase];
+  // Status-färg
+  const sc  = a.status >= 100 ? 'text-green-600' : a.status > 0 ? 'text-orange-500' : 'text-gray-400';
+  // Progress bar färg
+  const pb  = a.status >= 100 ? 'bg-green-500' : a.status > 0 ? 'bg-orange-400' : 'bg-gray-300';
+  // Delstegsräknare
+  const doneSteps  = a.checklist.filter(i=>i.done).length;
+  const totalSteps = a.checklist.length;
+  // Huvud-checkbox: disabled om delsteg styr; klickbar om inga delsteg
+  const cbDisabled = !u.canComplete || totalSteps > 0;
+  return `
+  <tr class="border-b hover:bg-gray-50 ${a.done ? 'bg-green-50' : ''}">
+    <td class="px-4 py-3"><button onclick="toggleExpand(${a.id})" class="text-gray-400 hover:text-gray-600 text-xs transition-transform ${exp?'inline-block rotate-90':''}">▶</button></td>
+    <td class="px-4 py-3"><span style="white-space:nowrap" class="px-2 py-1 text-xs font-semibold rounded-full ${pc.bg} ${pc.tx} border ${pc.bo}">${pn}</span></td>
+    <td class="px-4 py-3">
+      <div class="flex flex-col gap-1">
+        <div class="flex items-center gap-2 flex-wrap">
+          <span class="text-xs text-gray-400 font-mono">${a.processNr}</span>
+          <span class="text-sm font-medium ${a.done?'text-gray-400 line-through':''}">${a.name}</span>
+          ${a.link?`<span title="${a.link}" class="text-purple-400 text-xs cursor-default">🔗</span>`:''}
+          ${a.inAPI?`<span class="flex items-center gap-1 px-2 py-0.5 bg-green-50 border border-green-300 rounded-full text-xs text-green-700" title="Synkas mot POL API"><span class="w-1.5 h-1.5 bg-green-500 rounded-full inline-block"></span>API</span>`:''}
+        </div>
+        ${totalSteps > 0 ? `
+        <div class="flex items-center gap-2 ml-7">
+          <div class="flex-1 max-w-xs bg-gray-200 rounded-full h-1.5">
+            <div class="h-1.5 rounded-full ${pb} transition-all" style="width:${a.status}%"></div>
+          </div>
+          <span class="text-xs text-gray-400">${doneSteps}/${totalSteps} delsteg</span>
+        </div>` : ''}
+      </div>
+    </td>
+    <td class="px-4 py-3 text-sm text-gray-500 hidden md:table-cell">${a.person}</td>
+    <td class="px-4 py-3 text-sm text-right font-semibold"><span class="${sc}">${a.status}%</span></td>
+    <td class="px-4 py-3 text-center">
+      <input type="checkbox" ${a.done?'checked':''} ${cbDisabled?'disabled':''}
+        onchange="${totalSteps===0 ? `toggleActivity(${a.id})` : ''}"
+        title="${totalSteps > 0 ? 'Styrs av delstegen i checklistan' : ''}"
+        class="w-5 h-5 text-purple-600 rounded ${cbDisabled?'opacity-50 cursor-not-allowed':'cursor-pointer'}">
+    </td>
+  </tr>
+  ${exp ? renderExpanded(a,u) : ''}`; }
+
+function renderExpanded(a, u) {
+  return `<tr class="bg-gray-50 border-b"><td colspan="6" class="px-4 py-4">
+    <div class="ml-8 space-y-4">
+
+      <!-- POL-referens -->
+      <div class="bg-purple-50 border border-purple-200 rounded-lg px-3 py-2">
+        <p class="text-xs text-purple-700 font-medium">📖 POL-referens: ${a.polRef}</p>
+        ${a.link ? `<p class="text-xs text-purple-600 mt-0.5">🔗 Sökväg i LA: <span class="font-mono">${a.link}</span></p>` : ''}
+      </div>
+
+      <!-- Checklista med per-delsteg fellistor och rapporter -->
+      ${a.checklist.length ? `
+        <div>
+          <h4 class="text-sm font-semibold mb-2 flex items-center gap-2">
+            📋 Checklista
+            <span class="text-xs font-normal text-gray-400">${a.checklist.filter(i=>i.done).length} av ${a.checklist.length} klara</span>
+          </h4>
+          <div class="bg-white rounded-lg shadow-sm overflow-hidden">
+            <div class="w-full bg-gray-100 h-1">
+              <div class="h-1 ${a.status>=100?'bg-green-500':a.status>0?'bg-orange-400':'bg-gray-300'} transition-all" style="width:${a.status}%"></div>
+            </div>
+            <table class="w-full">
+              <thead class="bg-gray-50 border-b"><tr>
+                <th class="px-4 py-2 text-left text-xs font-medium text-gray-600">Delsteg</th>
+                <th class="px-4 py-2 text-left text-xs font-medium text-gray-600 hidden md:table-cell">Fellista / Rapport</th>
+                <th class="px-4 py-2 text-center text-xs font-medium text-gray-600 w-16">Klar</th>
+              </tr></thead>
+              <tbody>${a.checklist.map(i => {
+                const hasExtras = (i.errorLists && i.errorLists.length) || (i.reports && i.reports.length);
+                return `<tr class="border-b last:border-0 ${i.done?'bg-green-50':'hover:bg-gray-50'}">
+                  <td class="px-4 py-2.5">
+                    <div class="flex items-center gap-2">
+                      <span class="text-sm ${i.done?'line-through text-gray-400':''}">${i.name}</span>
+                      ${i.done ? '<span class="text-green-500 text-xs">✓</span>' : ''}
+                    </div>
+                  </td>
+                  <td class="px-4 py-2.5 hidden md:table-cell">
+                    ${hasExtras ? `<div class="flex flex-wrap gap-1">
+                      ${(i.errorLists||[]).map(e=>`
+                        <span class="inline-flex items-center gap-1 px-2 py-0.5 bg-red-50 border border-red-200 rounded-full text-xs text-red-700">
+                          <span>⚠️</span>${e}
+                        </span>`).join('')}
+                      ${(i.reports||[]).map(r=>`
+                        <span class="inline-flex items-center gap-1 px-2 py-0.5 bg-green-50 border border-green-200 rounded-full text-xs text-green-700">
+                          <span>📊</span>${r}
+                        </span>`).join('')}
+                    </div>` : '<span class="text-xs text-gray-300">–</span>'}
+                  </td>
+                  <td class="px-4 py-2.5 text-center">
+                    <input type="checkbox" ${i.done?'checked':''} ${!u.canComplete?'disabled':''}
+                      onchange="toggleChecklist(${a.id}, ${i.id})"
+                      class="w-4 h-4 text-purple-600 rounded ${!u.canComplete?'opacity-40 cursor-not-allowed':'cursor-pointer'}">
+                  </td>
+                </tr>`;
+              }).join('')}</tbody>
+            </table>
+          </div>
+          <p class="text-xs text-gray-400 mt-1 ml-1">↑ Delstegen styr aktivitetens procent och "Klar"-status automatiskt</p>
+        </div>` : '<p class="text-xs text-gray-400 italic">Ingen checklista – markera aktiviteten manuellt som klar.</p>'}
+
+      <!-- Kommentar -->
+      <div class="bg-blue-50 border border-blue-200 rounded-lg p-3 flex items-start justify-between">
+        <div class="flex-1">
+          <p class="text-xs font-semibold text-blue-900 mb-1">💬 Kommentar:</p>
+          ${a.comment ? `<p class="text-sm text-gray-700">${a.comment}</p>` : '<p class="text-xs text-gray-400 italic">Ingen kommentar</p>'}
+        </div>
+        <button onclick="openCommentModal(${a.id})" class="text-xs text-blue-600 hover:text-blue-800 ml-3 whitespace-nowrap">${a.comment?'Redigera':'Lägg till'}</button>
+      </div>
+
+    </div>
+  </td></tr>`; }
+
+function renderCommentModal() {
+  const a = activities.find(x=>x.id===commentActivityId); if(!a) return '';
+  return `<div class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onclick="closeCommentModal(event)">
+    <div class="bg-white rounded-lg p-6 w-full max-w-md shadow-xl" onclick="event.stopPropagation()">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-lg font-semibold">Kommentar – ${a.name}</h3>
+        <button onclick="closeCommentModal()" class="text-gray-400 hover:text-gray-700 text-2xl leading-none">&times;</button>
+      </div>
+      <textarea id="commentText" rows="4" placeholder="Skriv din kommentar..." class="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-purple-500 text-sm">${a.comment}</textarea>
+      <div class="flex justify-end gap-3 mt-4">
+        <button onclick="closeCommentModal()" class="px-4 py-2 text-sm text-gray-600 border rounded-lg hover:bg-gray-50">Avbryt</button>
+        <button onclick="saveComment()"        class="px-4 py-2 text-sm bg-purple-600 text-white rounded-lg hover:bg-purple-700">Spara</button>
+      </div>
+    </div>
+  </div>`; }
+
+function renderPerioder(u) { return `
+  ${!u.canEdit?'<div class="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-4"><p class="text-sm text-yellow-800">⚠️ Kontakta lönechef för ändringar</p></div>':''}
+  <div class="bg-white rounded-lg shadow-sm p-6">
+    <h2 class="text-xl font-bold mb-4">Löneperioder 2025</h2>
+    <div class="space-y-3">
+      <div class="flex justify-between items-center p-4 bg-gray-50 rounded-lg"><div><span class="font-medium">2025-01</span><span class="text-xs text-gray-400 ml-2">Januari</span></div><span class="px-3 py-1 bg-green-100 text-green-800 text-xs font-semibold rounded-full">Avslutad</span></div>
+      <div class="flex justify-between items-center p-4 bg-gray-50 rounded-lg"><div><span class="font-medium">2025-02</span><span class="text-xs text-gray-400 ml-2">Februari</span></div><span class="px-3 py-1 bg-green-100 text-green-800 text-xs font-semibold rounded-full">Avslutad</span></div>
+      <div class="flex justify-between items-center p-4 bg-blue-50 rounded-lg border-2 border-blue-200"><div><span class="font-medium">2025-03</span><span class="text-xs text-gray-400 ml-2">Mars</span></div><span class="px-3 py-1 bg-blue-100 text-blue-800 text-xs font-semibold rounded-full">Aktiv</span></div>
+      <div class="flex justify-between items-center p-4 bg-gray-50 rounded-lg"><div><span class="font-medium">2025-04</span><span class="text-xs text-gray-400 ml-2">April</span></div><span class="px-3 py-1 bg-gray-200 text-gray-600 text-xs font-semibold rounded-full">Planerad</span></div>
+    </div>
+  </div>`; }
+
+function renderVerktyg() {
+  const u = USERS[loggedInUser];
+  const fore   = activities.filter(a=>a.phase==='fore');
+  const kont   = activities.filter(a=>a.phase==='kontroll');
+  const efter  = activities.filter(a=>a.phase==='efter');
+  const selected = activities.find(a=>a.id===selectedActivityId) || activities[0];
+  
+  function treeItem(a, indent) {
+    const isActive = a.id === selectedActivityId;
+    return `<div onclick="selectActivity(${a.id})" class="flex items-center gap-1 py-1 px-2 rounded cursor-pointer transition-colors ${indent} ${isActive?'bg-purple-100 text-purple-700 font-medium':'hover:bg-gray-100 hover:text-purple-600'}">
+      <span class="text-xs">${isActive?'▸':''}</span>
+      <span class="text-gray-400 text-xs">📄</span>
+      <span class="text-xs">${a.processNr} ${a.name}</span>
+      ${a.inAPI?'<span class="w-1.5 h-1.5 bg-green-500 rounded-full inline-block" title="API-kopplad"></span>':''}
+    </div>`;
+  }
+  
+  return `<div class="grid grid-cols-3 gap-6">
+    <div class="bg-white rounded-lg shadow-sm p-4 max-h-[calc(100vh-200px)] overflow-y-auto">
+      <h3 class="text-sm font-semibold mb-4 sticky top-0 bg-white pb-2 border-b">📁 Verktygslåda – POL-aktiviteter</h3>
+      <div class="space-y-1 text-gray-700">
+        <div class="font-semibold text-xs text-blue-800 mt-1 mb-1">📁 Fas 1 – Före Löneberäkning</div>
+        ${fore.map(a=>treeItem(a,'ml-1')).join('')}
+        <div class="font-semibold text-xs text-orange-800 mt-3 mb-1">📁 Fas 2 – Kontrollperiod</div>
+        ${kont.map(a=>treeItem(a,'ml-1')).join('')}
+        <div class="font-semibold text-xs text-green-800 mt-3 mb-1">📁 Fas 3 – Efter Löneberäkning</div>
+        ${efter.map(a=>treeItem(a,'ml-1')).join('')}
+      </div>
+    </div>
+    
+    <div class="col-span-2 bg-white rounded-lg shadow-sm p-6">
+      <h3 class="text-lg font-semibold mb-1">Redigera Aktivitet</h3>
+      <p class="text-xs text-gray-400 mb-4">Baserat på POL LA Användarhandbok 2025.2</p>
+      
+      ${!u.canEdit ? '<div class="bg-yellow-50 border border-yellow-200 rounded-lg p-3 mb-4 text-sm text-yellow-800">⚠️ Du har endast läsrättigheter</div>' : ''}
+      
+      <div class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium text-gray-600 mb-1">Benämning</label>
+          <input id="edit_name" type="text" value="${selected.name}" ${!u.canEdit?'disabled':''} 
+            class="w-full px-3 py-2 border rounded-lg text-sm ${!u.canEdit?'bg-gray-50 text-gray-500':''}">
+        </div>
+        
+        <div>
+          <label class="block text-sm font-medium text-gray-600 mb-1">Ansvarig</label>
+          <select id="edit_person" ${!u.canEdit?'disabled':''} class="w-full px-3 py-2 border rounded-lg text-sm ${!u.canEdit?'bg-gray-50 text-gray-500':''}">
+            <option ${selected.person==='Elif Bylund'?'selected':''}>Elif Bylund</option>
+            <option ${selected.person==='Hassan Sundberg'?'selected':''}>Hassan Sundberg</option>
+            <option ${selected.person==='Tua Jonasson'?'selected':''}>Tua Jonasson</option>
+          </select>
+        </div>
+        
+        <div>
+          <label class="block text-sm font-medium text-gray-600 mb-1">Sökväg i POL</label>
+          <input id="edit_link" type="text" value="${selected.link||''}" ${!u.canEdit?'disabled':''}
+            placeholder="LA > Arkiv > ..." class="w-full px-3 py-2 border rounded-lg text-sm ${!u.canEdit?'bg-gray-50 text-gray-500':''}">
+        </div>
+        
+        <div>
+          <label class="block text-sm font-medium text-gray-600 mb-1">POL-referens (manual)</label>
+          <input id="edit_polRef" type="text" value="${selected.polRef||''}" ${!u.canEdit?'disabled':''}
+            placeholder="POL LA s. ..." class="w-full px-3 py-2 border rounded-lg text-sm ${!u.canEdit?'bg-gray-50 text-gray-500':''}">
+          <p class="text-xs text-gray-400 mt-1">Exempel: "Driftsbilden – POL LA s. 272" eller "LA Bilaga s. 45"</p>
+        </div>
+        
+        <div class="bg-blue-50 border border-blue-200 rounded-lg p-3">
+          <p class="text-xs text-blue-800 font-medium mb-1">ℹ️ Om aktiviteten</p>
+          <div class="text-xs text-blue-700 space-y-0.5">
+            <p><span class="font-semibold">Fas:</span> ${{fore:'Före löneberäkning',kontroll:'Kontrollperiod',efter:'Efter löneberäkning'}[selected.phase]}</p>
+            <p><span class="font-semibold">Process-nr:</span> ${selected.processNr}</p>
+            <p><span class="font-semibold">Delsteg:</span> ${selected.checklist.length} st</p>
+            <p><span class="font-semibold">API-kopplad:</span> ${selected.inAPI?'Ja ✓':'Nej'}</p>
+          </div>
+        </div>
+        
+        ${u.canEdit ? `<div class="flex justify-end gap-3 pt-2 border-t">
+          <button onclick="deleteActivity(${selected.id})" class="px-4 py-2 text-sm text-red-600 border border-red-300 rounded-lg hover:bg-red-50">Ta bort</button>
+          <button onclick="saveActivity()" class="px-4 py-2 text-sm bg-purple-600 text-white rounded-lg hover:bg-purple-700">Spara ändringar</button>
+        </div>` : ''}
+      </div>
+    </div>
+  </div>`; }
+
+function renderFooter() {
+  const cfg = { checking:{c:'bg-yellow-400',p:'animate-pulse',i:'🔄',t:'Kontrollerar API…',tc:'text-yellow-700'}, connected:{c:'bg-green-500',p:'',i:'✓',t:'Ansluten till POL API',tc:'text-green-700'}, disconnected:{c:'bg-gray-400',p:'',i:'○',t:'Använder mockdata (API ej tillgängligt)',tc:'text-gray-600'}, error:{c:'bg-red-500',p:'',i:'✕',t:'API-fel',tc:'text-red-700'} }[apiStatus];
+  const ts = lastApiCheck ? ' • ' + lastApiCheck.toLocaleTimeString('sv-SE') : '';
+  return `<footer class="fixed bottom-0 left-0 right-0 bg-white border-t shadow">
+    <div class="max-w-7xl mx-auto px-4 py-2 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="relative"><div class="${cfg.c} ${cfg.p} w-3 h-3 rounded-full"></div>${apiStatus==='connected'?'<div class="absolute inset-0 w-3 h-3 bg-green-500 rounded-full animate-ping opacity-60"></div>':''}</div>
+        <span class="text-xs font-medium ${cfg.tc}">${cfg.i} ${cfg.t}${ts}</span>
+        <button onclick="retryAPIConnection()" class="text-xs text-purple-600 px-2 py-1 border border-purple-300 rounded hover:bg-purple-50">↻ Testa igen</button>
+        <span class="text-xs text-gray-400">${apiStatus==='connected'?'📡 '+activities.filter(a=>a.inAPI).length+' aktiviteter API-kopplade':'🔧 POL API: '+API_BASE_URL}</span>
+      </div>
+      <span class="text-xs text-gray-400">© 2026 CGI Inc. | Löneportalen v1.5.0 | Senast ändrad: 2026-02-17 16:00</span>
+    </div>
+  </footer>`; }
+
+/* ===== HANDLERS ===== */
+window.login              = ()  => { const e=document.getElementById('emailInput').value; USERS[e]?(sessionStorage.setItem('user',e),loggedInUser=e,render()):alert('Okänd e-post.'); };
+window.quickLogin         = e   => { sessionStorage.setItem('user',e); loggedInUser=e; render(); };
+window.logout             = ()  => { sessionStorage.removeItem('user'); loggedInUser=null; expandedActivities.clear(); render(); };
+window.changeTab          = t   => { currentTab=t; render(); };
+window.toggleExpand       = id  => { expandedActivities.has(id)?expandedActivities.delete(id):expandedActivities.add(id); render(); };
+
+/* Byt period: sparar ingenting extra (allt sparas löpande), laddar bara ny period */
+window.changePeriod = p => {
+  currentPeriod = p;
+  expandedActivities.clear();
+  render();
+};
+
+/* Räknar om status och done baserat på checklistan */
+function recalcActivity(a) {
+  if (a.checklist.length === 0) return;
+  const total = a.checklist.length;
+  const done  = a.checklist.filter(i => i.done).length;
+  a.status = Math.round(done / total * 100);
+  a.done   = done === total;
+}
+
+window.toggleActivity = id => {
+  const a = hydrated.find(x => x.id === id);
+  if (!a || !USERS[loggedInUser].canComplete) return;
+  if (a.checklist.length > 0) return; // styrs av delsteg
+  a.done   = !a.done;
+  a.status = a.done ? 100 : 0;
+  setPeriodActivity(currentPeriod, id, { done: a.done, status: a.status });
+  saveActivityToAPI(a);
+  render();
+};
+
+window.toggleChecklist = (activityId, itemId) => {
+  const a = hydrated.find(x => x.id === activityId);
+  if (!a || !USERS[loggedInUser].canComplete) return;
+  const item = a.checklist.find(i => i.id === itemId);
+  if (!item) return;
+  item.done = !item.done;
+  recalcActivity(a);
+  // Bygg checklist-map { itemId: done }
+  const clMap = {};
+  a.checklist.forEach(i => { clMap[i.id] = i.done; });
+  setPeriodActivity(currentPeriod, activityId, { done: a.done, status: a.status, checklist: clMap });
+  saveActivityToAPI(a);
+  render();
+};
+
+window.openCommentModal   = id  => { commentActivityId=id; showCommentModal=true; render(); };
+window.closeCommentModal  = ev  => { if(!ev||ev.target===ev.currentTarget){showCommentModal=false;commentActivityId=null;render();} };
+window.saveComment        = ()  => {
+  const a = hydrated.find(x => x.id === commentActivityId);
+  if (a) {
+    const txt = document.getElementById('commentText').value;
+    setPeriodActivity(currentPeriod, a.id, { comment: txt });
+    saveActivityToAPI({ ...a, comment: txt });
+    showCommentModal = false; commentActivityId = null;
+    render();
+  }
+};
+window.retryAPIConnection = async () => { apiStatus='checking'; render(); if(await checkApiHealth()) await loadActivitiesFromAPI(); render(); };
+
+/* ===== VERKTYGSLÅDA ===== */
+window.selectActivity = id => { selectedActivityId = id; render(); };
+window.saveActivity   = () => {
+  const a = activities.find(x => x.id === selectedActivityId);
+  if (!a || !USERS[loggedInUser].canEdit) return;
+  a.name   = document.getElementById('edit_name').value;
+  a.person = document.getElementById('edit_person').value;
+  a.link   = document.getElementById('edit_link').value;
+  a.polRef = document.getElementById('edit_polRef').value;
+  // Spara även till alla perioder där denna aktivitet har data
+  Object.keys(periodData).forEach(period => {
+    if (periodData[period][a.id]) {
+      // Metadata sparas inte per period, men vi triggar en re-render
+    }
+  });
+  render();
+  alert('Aktivitet uppdaterad! ✓');
+};
+window.deleteActivity = id => {
+  if (!USERS[loggedInUser].canDelete) return alert('Du har inte behörighet att ta bort aktiviteter.');
+  if (!confirm('Vill du verkligen ta bort denna aktivitet? Detta går inte att ångra.')) return;
+  const idx = activities.findIndex(a => a.id === id);
+  if (idx > -1) {
+    activities.splice(idx, 1);
+    selectedActivityId = activities[0]?.id || 1;
+    render();
+    alert('Aktivitet borttagen.');
+  }
+};
+
+/* ===== INIT ===== */
+async function init() {
+  loadPeriodData();
+  if (await checkApiHealth()) await loadActivitiesFromAPI();
+  render();
+}
+loggedInUser && USERS[loggedInUser] ? init() : (loadPeriodData(), render());
+</script>
+</body>
+</html>
