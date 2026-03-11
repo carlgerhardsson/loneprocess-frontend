@@ -1,0 +1,35 @@
+{
+  "name": "loneprocess-frontend",
+  "version": "1.5.0",
+  "description": "Löneportalen - Digital checklista för löneprocessen baserad på POL LA 2025.2",
+  "main": "src/loneportalen.html",
+  "scripts": {
+    "dev": "npx serve src",
+    "lint": "eslint src/**/*.html --ext .html",
+    "lint:fix": "eslint src/**/*.html --ext .html --fix",
+    "format": "prettier --write \"src/**/*.{html,css,js}\"",
+    "format:check": "prettier --check \"src/**/*.{html,css,js}\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/carlgerhardsson/loneprocess-frontend.git"
+  },
+  "keywords": [
+    "löneprocess",
+    "POL",
+    "checklista",
+    "löneadministration"
+  ],
+  "author": "Carl Gerhardsson",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/carlgerhardsson/loneprocess-frontend/issues"
+  },
+  "homepage": "https://github.com/carlgerhardsson/loneprocess-frontend#readme",
+  "devDependencies": {
+    "eslint": "^8.57.0",
+    "eslint-plugin-html": "^8.0.0",
+    "prettier": "^3.2.5",
+    "serve": "^14.2.1"
+  }
+}
