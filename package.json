@@ -5,10 +5,16 @@
   "main": "src/loneportalen.html",
   "scripts": {
     "dev": "npx serve src",
+    "test": "vitest run --coverage",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
     "lint": "eslint src/**/*.html --ext .html",
     "lint:fix": "eslint src/**/*.html --ext .html --fix",
     "format": "prettier --write \"src/**/*.{html,css,js}\"",
-    "format:check": "prettier --check \"src/**/*.{html,css,js}\""
+    "format:check": "prettier --check \"src/**/*.{html,css,js}\"",
+    "validate": "npm run lint && npm run format:check && npm run test",
+    "prepare": "husky install"
   },
   "repository": {
     "type": "git",
@@ -27,9 +33,22 @@
   },
   "homepage": "https://github.com/carlgerhardsson/loneprocess-frontend#readme",
   "devDependencies": {
+    "@playwright/test": "^1.41.0",
+    "@vitest/coverage-v8": "^1.2.0",
+    "@vitest/ui": "^1.2.0",
     "eslint": "^8.57.0",
     "eslint-plugin-html": "^8.0.0",
+    "husky": "^9.0.0",
+    "jsdom": "^24.0.0",
+    "lint-staged": "^15.2.0",
     "prettier": "^3.2.5",
-    "serve": "^14.2.1"
+    "serve": "^14.2.1",
+    "vitest": "^1.2.0"
+  },
+  "lint-staged": {
+    "*.{html,css,js}": [
+      "prettier --write",
+      "eslint --fix"
+    ]
   }
 }
