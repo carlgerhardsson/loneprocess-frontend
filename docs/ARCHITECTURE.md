@@ -1,317 +1,580 @@
-# Arkitektur - Löneportalen
+# 🏗️ Löneportalen - System Architecture
 
 ## Översikt
 
-Löneportalen är en single-page application (SPA) byggd med vanilla JavaScript. Arkitekturen är medvetet enkel för att hålla projektet lätt att underhålla utan byggsteg eller ramverk.
-
-## Teknisk stack
-
-| Komponent | Teknologi | Motivering |
-|-----------|-----------|------------|
-| **Frontend** | Vanilla JavaScript | Ingen build-process, lättare onboarding |
-| **Styling** | Tailwind CSS (CDN) | Utility-first, snabb utveckling |
-| **State** | localStorage | Persistens utan backend |
-| **Rendering** | Template literals | Reaktiv UI utan framework |
-| **Deployment** | GitHub Pages | Gratis, enkelt, automatiskt |
-
-## Arkitekturprinciper
-
-### 1. Single-File Architecture
-Hela applikationen finns i en enda HTML-fil (`loneportalen.html`). Detta ger:
-- ✅ Inga byggsteg eller bundlers
-- ✅ Enkel deployment (en fil att ladda upp)
-- ✅ Portabilitet (kan köras lokalt utan server)
-- ⚠️ Begränsat till ~1000 rader innan det blir ohanterligt
-
-### 2. Functional Reactive Rendering
-```javascript
-function render() {
-  hydrated = hydrateActivities(currentPeriod);
-  document.getElementById('app').innerHTML = 
-    (!loggedInUser || !USERS[loggedInUser]) 
-      ? renderLogin() 
-      : renderApp();
-}
-```
-
-Alla UI-uppdateringar sker via en central `render()`-funktion som:
-1. Hydraterar data från localStorage
-2. Genererar HTML via template literals
-3. Ersätter hela DOM-trädet
-
-**Fördel:** Enkel mental modell, inga virtuella DOM-diffar  
-**Nackdel:** Mindre performant vid stora dataset (>100 aktiviteter)
-
-### 3. State Management
-
-#### Global State
-```javascript
-let loggedInUser        // Inloggad användare
-let currentTab          // Aktiv flik (overblick/perioder/verktyg)
-let currentPeriod       // Vald månad (YYYY-MM)
-let expandedActivities  // Set av expanderade aktiviteter
-let selectedActivityId  // Vald aktivitet i Verktygslådan
-let periodData          // { "2025-03": { activityId: {...} } }
-```
-
-#### localStorage Schema
-```javascript
-{
-  "loneportalen_periodData": {
-    "2025-03": {
-      "1": {
-        "done": false,
-        "status": 33,
-        "comment": "Saknar FOS-svar för 3 nyanställda",
-        "checklist": {
-          "101": false,
-          "102": true,
-          "103": true
-        }
-      },
-      "2": { ... }
-    },
-    "2025-04": { ... }
-  }
-}
-```
-
-**Separationen mellan aktivitetsmallen och period-state är nyckeln:**
-- `activities` = oföränderlig mall (20 POL-aktiviteter)
-- `periodData` = föränderlig state per månad
-- `hydrateActivities(period)` = sammanfogar mall + state
-
-### 4. Per-Period State
-
-Varje månad har sin egen oberoende status. Detta möjliggör:
-- Parallell bearbetning av flera månader
-- Historisk återblick (granska Mars efter April är klar)
-- Rollback (om Mars blev fel, återställ från tidigare version)
-
-**Flöde:**
-```
-Användare byter till "2025-04"
-  ↓
-changePeriod("2025-04")
-  ↓
-currentPeriod = "2025-04"
-  ↓
-render() → hydrateActivities("2025-04")
-  ↓
-Hämtar periodData["2025-04"] från localStorage
-  ↓
-Applicerar status på activities-mallen
-  ↓
-Renderar UI med April-data
-```
-
-### 5. Aktivitetsstruktur
-
-```javascript
-{
-  id: 2,                    // Unikt ID
-  processNr: '1.2',         // Synligt process-nummer
-  phase: 'fore',            // Fas (fore/kontroll/efter)
-  name: 'Hantera nyanställningar...',
-  person: 'Elif Bylund',    // Ansvarig
-  done: false,              // Hel aktivitet klar?
-  status: 0,                // Procent (0-100)
-  comment: '',              // Fri text
-  link: 'LA > Anställningsregister',  // Sökväg i POL
-  polRef: 'POL LA s. 128',  // Manualsidangivelse
-  inAPI: true,              // Synkas mot backend?
-  checklist: [              // Delsteg
-    {
-      id: 201,
-      name: 'Registrera nyanställningar...',
-      done: false,
-      errorLists: [],       // Fellistor kopplade till detta delsteg
-      reports: ['Personlogg']  // Rapporter kopplade till detta delsteg
-    }
-  ]
-}
-```
-
-**Viktigt:** `errorLists` och `reports` flyttades från aktivitetsnivå till delstegsnivå i v1.4.0 för att ge mer precision.
-
-### 6. Status-beräkning
-
-**Före v1.2:** Manuell markering (aktivitet.done → status = 100%)
-
-**Från v1.2:** Delsteg-driven
-```javascript
-function recalcActivity(a) {
-  if (a.checklist.length === 0) return; // Inga delsteg → manuell
-  const total = a.checklist.length;
-  const done  = a.checklist.filter(i => i.done).length;
-  a.status = Math.round(done / total * 100);
-  a.done   = done === total;  // Klar endast när alla delsteg är klara
-}
-```
-
-**Total framdrift:**
-```javascript
-const totalSteps = activities.reduce((s,a) => s + (a.checklist.length || 1), 0);
-const doneSteps  = activities.reduce((s,a) => {
-  if (a.checklist.length > 0) 
-    return s + a.checklist.filter(i=>i.done).length;
-  return s + (a.done ? 1 : 0);
-}, 0);
-const pct = Math.round(doneSteps / totalSteps * 100);
-```
-
-Detta ger en mycket mer granulär progress — 67 totala delsteg istället för 20 aktiviteter.
-
-## Data Flow
-
-### Användarinteraktion → State Update
-
-```
-Användare bockar delsteg 201
-  ↓
-toggleChecklist(activityId=2, itemId=201)
-  ↓
-Hittar hydrated aktivitet med id=2
-  ↓
-item.done = !item.done
-  ↓
-recalcActivity(a)  // Räknar om status & done
-  ↓
-Bygger checklist-map: { 201:true, 202:false, ... }
-  ↓
-setPeriodActivity(currentPeriod, 2, { done, status, checklist })
-  ↓
-Uppdaterar periodData["2025-03"]["2"]
-  ↓
-Sparar till localStorage
-  ↓
-saveActivityToAPI(a)  // Om API är anslutet
-  ↓
-render()  // Re-renderar hela UI
-```
-
-## Prestanda-överväganden
-
-### Nuvarande begränsningar
-- **Re-render hela DOM:** Varje state-ändring triggar fullständig re-render
-- **Ingen virtuell DOM:** Innebär mer arbete för webbläsaren
-- **Inga optimeringar:** Inga React.memo-motsvarigheter
-
-### Varför det funkar ändå
-- **Liten dataset:** 20 aktiviteter, 67 delsteg
-- **Låg uppdateringsfrekvens:** Användaren bockar ~1-2 delsteg/minut
-- **Ingen realtidsdata:** Ingen polling eller websockets
-
-### Skalbarhetsgräns
-Vid >100 aktiviteter eller >500 delsteg bör vi migrera till:
-- React + virtuell DOM
-- Eller: Granulära DOM-uppdateringar med `querySelector`
-
-## API Integration (Framtida)
-
-```javascript
-async function saveActivityToAPI(a) {
-  if (apiStatus !== 'connected' || !a.inAPI) return;
-  try {
-    await fetch(`${API_BASE_URL}/activities/${a.id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        id: a.id,
-        completed: a.done,
-        completion_percentage: a.status,
-        comment: a.comment
-      })
-    });
-  } catch (err) {
-    console.error('API save failed:', err);
-  }
-}
-```
-
-**5 aktiviteter markerade som `inAPI: true`:**
-- 1.2 Hantera nyanställningar
-- 1.3 Slutlöner
-- 1.5 Fasta tillägg/retroaktivitet
-- 1.6 Tillfälliga lönehändelser
-- 2.4 Frånvarokontroll
-
-Dessa synkas mot backend när API är tillgängligt.
-
-## Säkerhet
-
-### Nuvarande läge (client-only)
-- ✅ Ingen backend = ingen attack surface
-- ✅ localStorage är sandboxad per origin
-- ⚠️ Ingen autentisering (demo-lösenord i klartext)
-- ⚠️ Ingen kryptering av localStorage-data
-
-### När backend introduceras
-- [ ] JWT-baserad autentisering
-- [ ] HTTPS-only
-- [ ] CORS-policy
-- [ ] Rate limiting på API
-- [ ] Kryptering av känslig data (personnummer i kommentarer?)
-
-## Framtida förbättringar
-
-### Kortsiktiga (v1.6-v1.9)
-- [ ] Export/import av data (JSON, Excel)
-- [ ] Tidsstämplar på delsteg (auditlogg)
-- [ ] Sökfunktion i aktivitetslistan
-- [ ] Filter per ansvarig/fas/API-status
-
-### Långsiktiga (v2.0+)
-- [ ] Migrera till React + TypeScript
-- [ ] Backend-integration (REST API)
-- [ ] Realtidssynk mellan användare (WebSockets)
-- [ ] Notifikationer/påminnelser (e-post, Slack)
-- [ ] POL-chatbot med RAG
-
-## Testning
-
-### Nuvarande (ingen automatiserad testning)
-- Manuell QA i Chrome, Firefox, Safari
-- Explorativ testning efter varje release
-
-### Framtida
-```yaml
-# .github/workflows/test.yml
-- Playwright E2E-tester
-  - Logga in
-  - Bocka delsteg
-  - Byt period
-  - Kontrollera persistens
-- ESLint för kodkvalitet
-- Lighthouse för prestanda
-```
-
-## Deployment
-
-```mermaid
-graph LR
-    A[Push till main] --> B[GitHub Actions]
-    B --> C[Lint & Test]
-    C --> D[Build inget byggsteg]
-    D --> E[Deploy till GitHub Pages]
-    E --> F[Live på carlgerhardsson.github.io]
-```
-
-Eftersom vi inte har byggsteg är deployment extremt enkelt — GitHub Pages serverar `src/loneportalen.html` direkt.
-
-## Appendix: Designbeslut
-
-| Beslut | Alternativ | Motivering |
-|--------|------------|------------|
-| Single-file | Multi-file (HTML/CSS/JS) | Portabilitet, enkel deployment |
-| Vanilla JS | React/Vue | Ingen overhead, lätt att lära |
-| localStorage | Backend DB | Fungerar offline, ingen server-kostnad |
-| Template literals | JSX | Native JS, inget byggsteg |
-| Tailwind CDN | Custom CSS | Snabb utveckling, konsekvent design |
-| GitHub Pages | Vercel/Netlify | Gratis, integrerat med GitHub |
+Löneportalen är en single-page application (SPA) för att hantera löneprocessen enligt POL LA Användarhandbok 2025.2. Applikationen är byggd som en standalone HTML-fil med inbäddad JavaScript och CSS, designad för maximal portabilitet och minimal komplexitet.
 
 ---
 
-**Skapad:** 2026-02-17  
-**Senast uppdaterad:** 2026-02-17  
-**Version:** 1.5.0
+## 📋 Innehållsförteckning
+
+- [Teknisk Stack](#teknisk-stack)
+- [Arkitekturprinciper](#arkitekturprinciper)
+- [Datamodell](#datamodell)
+- [Komponentstruktur](#komponentstruktur)
+- [State Management](#state-management)
+- [API Integration](#api-integration)
+- [Filstruktur](#filstruktur)
+
+---
+
+## 🛠️ Teknisk Stack
+
+### Frontend
+- **HTML5** - Semantisk markup
+- **Vanilla JavaScript (ES6+)** - Ingen framework-overhead
+- **Tailwind CSS** (CDN) - Utility-first styling
+- **Google Fonts** (Inter) - Modern typografi
+
+### Build & Deploy
+- **Ingen build-process** - Direct-to-browser
+- **GitHub Pages** - Statisk hosting
+- **GitHub Actions** - CI/CD automation
+
+### Testing & Quality
+- **Playwright** - E2E testing (18 tests)
+- **ESLint** - JavaScript linting
+- **Prettier** - Code formatting
+- **Lighthouse** - Performance audits
+
+### Security
+- **CodeQL** - Static code analysis
+- **Dependabot** - Dependency scanning
+- **Secret Scanning** - Credential detection
+- **npm audit** - Vulnerability checks
+
+---
+
+## 🎯 Arkitekturprinciper
+
+### 1. **Zero Dependencies Runtime**
+```html
+<!-- Inga npm packages i production -->
+<script src="https://cdn.tailwindcss.com"></script>
+<script>/* All app logic inline */</script>
+```
+
+**Fördelar:**
+- ✅ Inga version conflicts
+- ✅ Fungerar offline (efter första laddning)
+- ✅ Enkel deployment
+- ✅ Minimal attack surface
+
+### 2. **Single File Architecture**
+```
+loneportalen.html (55KB)
+├── HTML Structure
+├── CSS (Tailwind + Custom)
+├── JavaScript Application Logic
+└── Data (POL Activities embedded)
+```
+
+**Fördelar:**
+- ✅ Enkel att dela
+- ✅ Enkel att deploya
+- ✅ Enkel att underhålla
+- ✅ Inga broken dependencies
+
+### 3. **Progressive Enhancement**
+```javascript
+// Fungerar utan API
+const apiStatus = 'checking';
+activities.forEach(a => {
+  a.inAPI = false; // Fallback to local data
+});
+
+// Förbättras med API
+if (await checkApiHealth()) {
+  await loadActivitiesFromAPI();
+}
+```
+
+### 4. **Client-Side State Management**
+```javascript
+// localStorage för persistence
+const STORAGE_KEY = 'loneportalen_periodData';
+periodData = {
+  '2025-03': { activityId: { done, status, comment, checklist } }
+};
+```
+
+---
+
+## 📊 Datamodell
+
+### Aktivitetsstruktur
+
+```javascript
+{
+  id: 1,                    // Unik identifierare
+  processNr: '1.1',         // POL process-nummer
+  phase: 'fore',            // före | kontroll | efter
+  name: 'Aktivitetsnamn',
+  person: 'Elif Bylund',    // Ansvarig person
+  done: false,              // Slutförd?
+  status: 0,                // 0-100% (beräknas från delsteg)
+  comment: '',              // Fritext kommentar
+  link: 'LA > Path',        // Sökväg i POL
+  inAPI: true,              // Synkas mot backend?
+  checklist: [              // Delsteg
+    {
+      id: 101,
+      name: 'Delsteg beskrivning',
+      done: false,
+      errorLists: ['Fellista namn'],
+      reports: ['Rapport namn']
+    }
+  ],
+  polRef: 'POL LA s. 272'  // Manual-referens
+}
+```
+
+### Användarroller
+
+```javascript
+const USERS = {
+  'lonespecialist@loneportalen.se': {
+    name: 'Elif Bylund',
+    role: 'Lönespecialist',
+    canComplete: true,   // Kan markera som klar
+    canEdit: false,      // Kan redigera aktiviteter
+    canDelete: false     // Kan ta bort aktiviteter
+  },
+  'lonechef@loneportalen.se': {
+    name: 'Hassan Sundberg',
+    role: 'Lönechef',
+    canComplete: true,
+    canEdit: true,
+    canDelete: true      // Full access
+  },
+  'systemspecialist@loneportalen.se': {
+    name: 'Tua Jonasson',
+    role: 'Systemspecialist',
+    canComplete: false,  // Endast läsrättigheter för aktiviteter
+    canEdit: true,       // Kan redigera metadata
+    canDelete: false
+  }
+};
+```
+
+### Period-State
+
+```javascript
+periodData = {
+  '2025-03': {           // Period (YYYY-MM)
+    1: {                 // Activity ID
+      done: true,
+      status: 100,
+      comment: 'Klart!',
+      checklist: {
+        101: true,       // Checklist item ID: done status
+        102: false
+      }
+    }
+  }
+};
+```
+
+---
+
+## 🧩 Komponentstruktur
+
+### Huvudkomponenter
+
+```
+App
+├── Login
+│   ├── EmailInput
+│   ├── QuickLoginButtons
+│   └── TestUserInfo
+│
+├── Header
+│   ├── Logo
+│   ├── UserInfo
+│   └── LogoutButton
+│
+├── Navigation
+│   ├── Tab: Överblick
+│   ├── Tab: Löneperioder
+│   └── Tab: Verktygslåda
+│
+├── Överblick (Main View)
+│   ├── PeriodSelector
+│   ├── ProgressBar (Total)
+│   ├── PhaseCards (3x)
+│   │   ├── CircularProgress
+│   │   └── ActivityList
+│   └── ActivityTable
+│       └── ActivityRow[]
+│           ├── ExpandButton
+│           ├── PhaseTag
+│           ├── ActivityInfo
+│           ├── ProgressBar (Mini)
+│           ├── StatusPercent
+│           └── Checkbox
+│           └── (Expanded)
+│               ├── POL-Reference
+│               ├── Checklist
+│               │   └── ChecklistItem[]
+│               └── CommentSection
+│
+├── Löneperioder
+│   └── PeriodList
+│       └── PeriodCard[]
+│
+├── Verktygslåda
+│   ├── ActivityTree
+│   │   └── ActivityNode[]
+│   └── EditForm
+│       ├── NameInput
+│       ├── PersonSelect
+│       ├── LinkInput
+│       ├── POL-RefInput
+│       └── ActionButtons
+│
+├── CommentModal
+│   ├── Textarea
+│   └── SaveButton
+│
+└── Footer
+    ├── APIStatus
+    └── VersionInfo
+```
+
+### Render-funktioner
+
+```javascript
+// Top-level rendering
+render()
+├── renderLogin()          // Login screen
+└── renderApp()            // Main application
+    ├── renderOversikt()   // Overview tab
+    ├── renderPerioder()   // Periods tab
+    └── renderVerktyg()    // Toolbox tab
+
+// Sub-components
+renderRow(activity, user)           // Table row
+renderExpanded(activity, user)      // Expanded details
+phaseCard(title, pct, list)         // Phase progress card
+circle(pct, theme)                  // Circular progress
+renderCommentModal()                // Comment dialog
+renderFooter()                      // Footer with API status
+```
+
+---
+
+## 🔄 State Management
+
+### State Variables
+
+```javascript
+// Session state (lost on refresh)
+let loggedInUser = sessionStorage.getItem('user');
+let currentTab = 'overblick';
+let expandedActivities = new Set();
+let showCommentModal = false;
+let commentActivityId = null;
+
+// Persistent state (localStorage)
+let currentPeriod = '2025-03';
+let periodData = {};  // Loaded from localStorage
+
+// API state
+let apiStatus = 'checking';      // checking | connected | disconnected
+let lastApiCheck = null;
+let apiActivities = [];
+```
+
+### State Flow
+
+```
+User Action → Event Handler → State Update → render() → DOM Update
+```
+
+Exempel:
+```javascript
+// 1. User clicks checkbox
+toggleChecklist(activityId, itemId)
+
+// 2. Update state
+item.done = !item.done;
+recalcActivity(activity);
+
+// 3. Save to localStorage
+setPeriodActivity(currentPeriod, activityId, {...});
+
+// 4. Sync to API
+saveActivityToAPI(activity);
+
+// 5. Re-render
+render();
+```
+
+### Persistence Strategy
+
+```javascript
+// Load on init
+function loadPeriodData() {
+  const raw = localStorage.getItem('loneportalen_periodData');
+  periodData = raw ? JSON.parse(raw) : {};
+}
+
+// Save on every change
+function savePeriodData() {
+  localStorage.setItem('loneportalen_periodData', 
+    JSON.stringify(periodData));
+}
+
+// Hydrate activities with saved state
+function hydrateActivities(period) {
+  return activities.map(a => {
+    const saved = periodData[period]?.[a.id];
+    return { ...a, ...saved };
+  });
+}
+```
+
+---
+
+## 🔌 API Integration
+
+### API Endpoints
+
+```javascript
+const API_BASE_URL = 'http://localhost:8000';
+const API_ENDPOINTS = {
+  health: '/health',
+  activities: '/api/v1/activities',
+  periods: '/api/v1/loneperiods'
+};
+```
+
+### API Functions
+
+```javascript
+// Health check
+async function checkApiHealth() {
+  try {
+    const r = await fetch(API_BASE_URL + '/health');
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Load activities
+async function loadActivitiesFromAPI() {
+  const r = await fetch(API_BASE_URL + '/api/v1/activities');
+  apiActivities = await r.json();
+  // Merge with local activities
+}
+
+// Save activity
+async function saveActivityToAPI(activity) {
+  if (!activity.inAPI) return;
+  
+  await fetch(`${API_BASE_URL}/api/v1/activities/${activity.id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      id: activity.id,
+      name: activity.name,
+      completed: activity.done,
+      completion_percentage: activity.status,
+      comment: activity.comment
+    })
+  });
+}
+```
+
+### API-Marked Activities
+
+```javascript
+// Only 5 activities sync with API
+activities.filter(a => a.inAPI) = [
+  { id: 2, name: 'Hantera nyanställningar...', inAPI: true },
+  { id: 3, name: 'Registrera slutlöner...', inAPI: true },
+  { id: 5, name: 'Uppdatera fasta tillägg...', inAPI: true },
+  { id: 6, name: 'Rapportera tillfälliga lönehändelser...', inAPI: true },
+  { id: 12, name: 'Kontrollera frånvaro...', inAPI: true }
+];
+```
+
+---
+
+## 📁 Filstruktur
+
+```
+loneprocess-frontend/
+├── .github/
+│   ├── workflows/
+│   │   ├── deploy-enhanced.yml    # Deploy med quality gates
+│   │   ├── deploy.yml             # Basic deploy
+│   │   ├── quality.yml            # Lint + Lighthouse
+│   │   ├── security.yml           # CodeQL + npm audit
+│   │   └── test.yml               # Playwright E2E tests
+│   └── CODEOWNERS                 # Code review automation
+│
+├── docs/
+│   ├── ARCHITECTURE.md            # Denna fil
+│   ├── CHANGELOG.md               # Version history
+│   └── POL_ACTIVITIES.md          # POL aktivitetslista
+│
+├── src/
+│   ├── index.html                 # Landing page
+│   └── loneportalen.html          # Main application (55KB)
+│
+├── tests/
+│   └── e2e/
+│       ├── login.spec.js          # Login tests (7 tests)
+│       └── activities.spec.js     # Activity tests (9 tests)
+│
+├── .eslintrc.json                 # ESLint config
+├── .gitignore                     # Git ignore rules
+├── .lighthouserc.json             # Lighthouse thresholds
+├── .prettierrc                    # Prettier config
+├── CONTRIBUTING.md                # Contribution guide
+├── LICENSE                        # MIT License
+├── package.json                   # Dependencies
+├── package-lock.json              # Locked versions
+├── playwright.config.js           # Playwright config
+└── README.md                      # Project overview
+```
+
+---
+
+## 🎨 Design Patterns
+
+### 1. **Module Pattern**
+```javascript
+// Encapsulated functionality
+const activities = [ /* data */ ];
+const USERS = { /* config */ };
+
+function render() { /* private logic */ }
+window.login = () => { /* public API */ };
+```
+
+### 2. **Observer Pattern**
+```javascript
+// State changes trigger re-render
+function toggleActivity(id) {
+  updateState();
+  render(); // Observer notified
+}
+```
+
+### 3. **Strategy Pattern**
+```javascript
+// Different rendering strategies per tab
+const renderers = {
+  overblick: renderOversikt,
+  perioder: renderPerioder,
+  verktyg: renderVerktyg
+};
+renderers[currentTab]();
+```
+
+### 4. **Template Pattern**
+```javascript
+// Reusable component templates
+function phaseCard(title, sub, theme, pct, list) {
+  const colors = themes[theme];
+  return `<div class="${colors.bg}">...</div>`;
+}
+```
+
+---
+
+## 🔧 Tekniska Beslut
+
+### Varför Single-File?
+- **Deployment**: Enkel att deploya (en fil)
+- **Portabilitet**: Fungerar överallt (ingen build)
+- **Underhåll**: Allt på ett ställe
+- **Performance**: Mindre requests
+
+### Varför Vanilla JS?
+- **Storlek**: Ingen framework-overhead
+- **Snabbhet**: Direct DOM manipulation
+- **Enkelhet**: Lättare att förstå
+- **Kontroll**: Full kontroll över rendering
+
+### Varför localStorage?
+- **Offline**: Fungerar utan backend
+- **Snabbhet**: Instant state restore
+- **Enkelhet**: Native browser API
+- **Privacy**: Data stannar på device
+
+### Varför Tailwind CDN?
+- **DX**: Snabb utveckling
+- **Consistency**: Design system built-in
+- **Size**: Purged i production (om build)
+- **Flexibilitet**: Easy customization
+
+---
+
+## 📈 Performance
+
+### Metrics (Lighthouse)
+- **Performance**: ≥80%
+- **Accessibility**: ≥90%
+- **Best Practices**: ≥90%
+- **SEO**: ≥80%
+
+### Optimization Strategies
+- ✅ Minimal DOM manipulation
+- ✅ Event delegation
+- ✅ Lazy rendering (expand on demand)
+- ✅ LocalStorage caching
+- ✅ CDN för externa resources
+
+---
+
+## 🔐 Security
+
+### Client-Side Security
+- ✅ No eval() or innerHTML (XSS protection)
+- ✅ CSP-ready architecture
+- ✅ No sensitive data in localStorage
+- ✅ HTTPS-only deployment
+
+### Backend Integration Security
+- ✅ API calls over HTTPS only
+- ✅ No credentials in frontend
+- ✅ CORS handling
+- ✅ Input validation
+
+---
+
+## 🚀 Future Enhancements
+
+### Planned Features
+- [ ] PWA support (Service Worker)
+- [ ] Offline sync queue
+- [ ] Export to Excel/PDF
+- [ ] Email notifications
+- [ ] Real-time collaboration
+- [ ] Advanced analytics dashboard
+
+### Technical Debt
+- [ ] Add JSDoc comments
+- [ ] Extract CSS to separate file
+- [ ] Add unit tests (Vitest)
+- [ ] Implement virtual scrolling for large lists
+- [ ] Add error boundaries
+
+---
+
+## 📚 References
+
+- [POL LA Användarhandbok 2025.2](../project/LA_POL_2025_2.pdf)
+- [Tailwind CSS Documentation](https://tailwindcss.com)
+- [Playwright Documentation](https://playwright.dev)
+- [GitHub Actions Documentation](https://docs.github.com/actions)
+
+---
+
+**Version:** 1.5.0  
+**Last Updated:** 2026-03-11  
+**Maintainer:** Carl Gerhardsson
