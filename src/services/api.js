@@ -117,8 +117,8 @@ class LoneprocessAPI {
     
     return {
       totalEntries: entries.length,
-      freshEntries: entries.filter(([_, v]) => now - v.timestamp < this.cacheTimeout).length,
-      oldestEntry: entries.length > 0 ? Math.max(...entries.map(([_, v]) => now - v.timestamp)) / 1000 : 0,
+      freshEntries: entries.filter(([, v]) => now - v.timestamp < this.cacheTimeout).length,
+      oldestEntry: entries.length > 0 ? Math.max(...entries.map(([, v]) => now - v.timestamp)) / 1000 : 0,
       requestCount: this.requestCount,
       lastRequest: this.lastRequestTime ? new Date(this.lastRequestTime).toISOString() : null
     };
