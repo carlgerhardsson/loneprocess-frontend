@@ -33,7 +33,7 @@
   },
   "homepage": "https://github.com/carlgerhardsson/loneprocess-frontend#readme",
   "devDependencies": {
-    "@playwright/test": "^1.40.0",
+    "@playwright/test": "^1.58.2",
     "@lhci/cli": "^0.13.0",
     "eslint": "^8.55.0",
     "eslint-plugin-html": "^7.1.0",
